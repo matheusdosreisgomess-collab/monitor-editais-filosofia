@@ -46,8 +46,8 @@ TERMOS = [
     '"processo seletivo simplificado"',
 ]
 HDRS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/126.0 Safari/537.36",
+    "User-Agent": "monitor-editais-filosofia/1.0 (+https://github.com/matheusdosreisgomess-collab/"
+                  "monitor-editais-filosofia; coleta diaria de editais docentes)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.5",
 }
@@ -94,18 +94,40 @@ def sessao():
     return s
 
 
+def sonda(nome, s, dia):
+    """Testa a busca e a leitura do jornal para um dia e diz se alguma devolve dados."""
+    d = dia.strftime("%d-%m-%Y")
+    alvos = [
+        ("busca", f"{BASE}/consulta/-/buscar/dou",
+         {"q": '"professor"', "s": "todos", "exactDate": "personalizado", "publishFrom": d, "publishTo": d, "sortType": "0"}),
+        ("leitura", f"{BASE}/leiturajornal", {"data": d, "secao": "do3"}),
+    ]
+    ok = False
+    for rotulo, url, params in alvos:
+        try:
+            r = s.get(url, params=params, timeout=45)
+            arr = json_array(r.text) if r.status_code == 200 else None
+            extra = f"{len(arr)} itens" if arr is not None else f"início: {' '.join(r.text[:160].split())!r}"
+            print(f"  sonda {nome} {rotulo} {d}: HTTP {r.status_code}, server={r.headers.get('server')}, "
+                  f"{len(r.text)} bytes, jsonArray={'sim' if arr is not None else 'não'}, {extra}")
+            ok = ok or arr is not None
+        except Exception as e:  # noqa: BLE001
+            print(f"  sonda {nome} {rotulo} {d}: {type(e).__name__}: {str(e)[:160]}")
+    return ok
+
+
 def baixa(s, url, params=None):
     ultimo = None
-    for t in range(3):
+    for t in range(2):
         try:
-            r = s.get(url, params=params, timeout=90)
+            r = s.get(url, params=params, timeout=45)
             if r.status_code in (429, 500, 502, 503, 504):
                 raise requests.HTTPError(f"HTTP {r.status_code}")
             r.raise_for_status()
             return r
         except Exception as e:  # noqa: BLE001
             ultimo = e
-            time.sleep(6 * (t + 1) ** 2)
+            time.sleep(5)
     raise ultimo
 
 
@@ -301,8 +323,24 @@ def main():
     ap.add_argument("--retro", type=int, default=2, help="dias anteriores a reprocessar")
     a = ap.parse_args()
     fim = dt.date.fromisoformat(a.data) if a.data else dt.datetime.now(TZ).date()
+    util = fim
+    while util.weekday() >= 5:
+        util -= dt.timedelta(days=1)
     s = sessao()
     falhas, total = 0, max(0, a.retro) + 1
+    print("Sondagem do portal do DOU:")
+    if not sonda("requests", s, util):
+        print("O portal do DOU não devolveu dados; a coleta fica registrada como falha e nada é contornado.")
+        agora = dt.datetime.now(TZ).isoformat(timespec="seconds")
+        for k in range(total):
+            dia = fim - dt.timedelta(days=k)
+            caminho = os.path.join(SAIDA, f"{dia.isoformat()}.json")
+            if not os.path.exists(caminho):
+                grava({"data": dia.isoformat(), "gerado_em": agora, "consulta": {"ok": False},
+                       "relevantes": [], "docentes_sem_area": [],
+                       "erros": ["O portal do DOU recusou ou não respondeu à consulta automatizada"]}, caminho)
+        consolida()
+        return 1
     for k in range(total - 1, -1, -1):
         dia = fim - dt.timedelta(days=k)
         rel = coleta_dia(s, dia)
