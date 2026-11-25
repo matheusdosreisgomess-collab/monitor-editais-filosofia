@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Coleta do Diário Oficial da União (Seção 3) para o monitor de editais de filosofia.
+"""Coleta do Diário Oficial da União para o monitor de editais de filosofia.
 
-Para cada dia, lê a edição inteira da Seção 3 (e a extra, quando houver), separa os
-editais docentes de universidades federais, institutos federais, CEFETs e Colégio
-Pedro II, abre o texto integral de cada um e marca os que mencionam Filosofia,
-Ciências Humanas ou áreas de Educação ligadas à filosofia.
+Para cada dia, consulta a busca do DOU com termos dos três eixos (Filosofia, Ciências
+Humanas, Educação) e termos gerais de seleção docente, separa os editais de
+universidades federais, institutos federais, CEFETs e Colégio Pedro II, abre o texto
+integral de cada um e marca os que citam filosofia, ciências humanas ou áreas de
+educação ligadas à filosofia. Se a busca falhar, tenta a página de leitura do jornal.
 
 Saída:
   dados/dou/AAAA-MM-DD.json  um arquivo por dia
@@ -31,15 +32,23 @@ from bs4 import BeautifulSoup
 
 TZ = ZoneInfo("America/Sao_Paulo")
 BASE = "https://www.in.gov.br"
-SECOES = ["do3", "do3e"]
 RAIZ = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 SAIDA = os.path.join(RAIZ, "dados", "dou")
 MANTER_DIAS = 30
 DIAS_RECENTES = 8
 PAUSA = 1.0
+POR_PAGINA = 75
+MAX_PAGINAS = 3
+MAX_TEXTOS = 160
+TERMOS = [
+    '"filosofia"', '"ciências humanas"', '"fundamentos da educação"', '"humanidades"',
+    '"professor substituto"', '"professor visitante"', '"magistério superior"',
+    '"processo seletivo simplificado"',
+]
 HDRS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.5",
 }
 
@@ -52,6 +61,10 @@ def dobra(c):
 
 def norm(s):
     return "".join(dobra(c) for c in (s or ""))
+
+
+def sem_tags(s):
+    return re.sub(r"<[^>]+>", " ", str(s or ""))
 
 
 ORGAO = re.compile(r"universidade|instituto federal|centro federal|colegio pedro ii")
@@ -81,29 +94,78 @@ def sessao():
     return s
 
 
-def leitura_jornal(s, dia, secao):
-    """Lista de atos de uma seção em um dia, a partir da página de leitura do jornal."""
-    r = s.get(f"{BASE}/leiturajornal", params={"data": dia.strftime("%d-%m-%Y"), "secao": secao}, timeout=90)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+def baixa(s, url, params=None):
+    ultimo = None
+    for t in range(3):
+        try:
+            r = s.get(url, params=params, timeout=90)
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            return r
+        except Exception as e:  # noqa: BLE001
+            ultimo = e
+            time.sleep(6 * (t + 1) ** 2)
+    raise ultimo
+
+
+def json_array(html):
+    soup = BeautifulSoup(html, "html.parser")
     for sc in soup.find_all("script"):
         txt = sc.string or sc.get_text() or ""
-        if "jsonArray" in txt:
-            try:
-                return json.loads(txt).get("jsonArray", []) or []
-            except json.JSONDecodeError:
-                m = re.search(r"\{.*\}", txt, re.S)
-                if m:
-                    return json.loads(m.group(0)).get("jsonArray", []) or []
-    if "jsonArray" not in r.text:
+        if "jsonArray" not in txt:
+            continue
+        try:
+            return json.loads(txt).get("jsonArray") or []
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", txt, re.S)
+            if m:
+                return json.loads(m.group(0)).get("jsonArray") or []
+    return None
+
+
+def amostra(r):
+    return f"HTTP {r.status_code}, {len(r.text)} bytes, início: {' '.join(r.text[:200].split())!r}"
+
+
+def busca(s, dia, termo, diag):
+    d = dia.strftime("%d-%m-%Y")
+    vistos, itens = set(), []
+    for pagina in range(1, MAX_PAGINAS + 1):
+        params = {"q": termo, "s": "todos", "exactDate": "personalizado", "publishFrom": d,
+                  "publishTo": d, "sortType": "0", "delta": str(POR_PAGINA)}
+        if pagina > 1:
+            params.update({"currentPage": str(pagina), "newPage": str(pagina)})
+        r = baixa(s, f"{BASE}/consulta/-/buscar/dou", params)
+        arr = json_array(r.text)
+        if arr is None:
+            diag.append(f"busca {termo} p{pagina}: sem jsonArray ({amostra(r)})")
+            if pagina == 1:
+                raise RuntimeError("busca sem jsonArray")
+            break
+        novos = [i for i in arr if i.get("urlTitle") and i.get("urlTitle") not in vistos]
+        vistos.update(i.get("urlTitle") for i in novos)
+        itens += novos
+        diag.append(f"busca {termo} p{pagina}: {len(arr)} itens, {len(novos)} novos")
+        if len(arr) < POR_PAGINA or not novos:
+            break
+        time.sleep(PAUSA)
+    return itens
+
+
+def leitura_jornal(s, dia, secao, diag):
+    r = baixa(s, f"{BASE}/leiturajornal", {"data": dia.strftime("%d-%m-%Y"), "secao": secao})
+    arr = json_array(r.text)
+    if arr is None:
+        diag.append(f"leitura {secao}: sem jsonArray ({amostra(r)})")
         return []
-    raise RuntimeError(f"jsonArray presente mas ilegível em {secao} {dia}")
+    diag.append(f"leitura {secao}: {len(arr)} atos")
+    return arr
 
 
 def texto_integral(s, url_title):
     url = f"{BASE}/web/dou/-/{url_title}"
-    r = s.get(url, timeout=90)
-    r.raise_for_status()
+    r = baixa(s, url)
     soup = BeautifulSoup(r.text, "html.parser")
     alvo = soup.select_one("div.texto-dou") or soup.select_one("div.materia") or soup.find("article") or soup.body or soup
     txt = alvo.get_text("\n", strip=True)
@@ -114,8 +176,8 @@ def eh_edital_docente(item):
     org = norm(item.get("hierarchyStr", ""))
     if "ministerio da educacao" not in org or not ORGAO.search(org):
         return False
-    titulo = norm(" ".join(str(item.get(k, "")) for k in ("title", "titulo", "subTitulo")))
-    corpo = norm(str(item.get("content", "")))
+    titulo = norm(" ".join(sem_tags(item.get(k, "")) for k in ("title", "titulo", "subTitulo")))
+    corpo = norm(sem_tags(item.get("content", "")))
     if EXCLUI.search(titulo + " " + corpo[:240]):
         return False
     tudo = titulo + " " + corpo
@@ -142,45 +204,60 @@ def instituicao(hier):
 
 def coleta_dia(s, dia):
     rel = {"data": dia.isoformat(), "gerado_em": dt.datetime.now(TZ).isoformat(timespec="seconds"),
-           "secoes": {}, "relevantes": [], "docentes_sem_area": [], "erros": []}
-    for secao in SECOES:
+           "consulta": {}, "relevantes": [], "docentes_sem_area": [], "erros": [], "diagnostico": []}
+    diag = rel["diagnostico"]
+    itens, falhas = {}, 0
+    for termo in TERMOS:
         try:
-            itens = leitura_jornal(s, dia, secao)
+            for it in busca(s, dia, termo, diag):
+                itens.setdefault(it["urlTitle"], it)
         except Exception as e:  # noqa: BLE001
-            rel["secoes"][secao] = {"ok": False}
-            if secao == "do3":
-                rel["erros"].append(f"{secao}: {type(e).__name__}: {e}"[:300])
-            continue
-        cand = [i for i in itens if eh_edital_docente(i)]
-        rel["secoes"][secao] = {"ok": True, "atos": len(itens), "docentes": len(cand)}
-        for it in cand:
-            time.sleep(PAUSA)
-            base = {
-                "titulo": " ".join(str(it.get("title") or it.get("titulo") or "").split()),
-                "orgao": it.get("hierarchyStr", ""),
-                "instituicao": instituicao(it.get("hierarchyStr", "")),
-                "tipo_ato": it.get("artType", ""),
-                "data": it.get("pubDate", ""),
-                "secao": secao,
-                "pagina": it.get("numberPage", ""),
-            }
+            falhas += 1
+            diag.append(f"busca {termo}: {type(e).__name__}: {e}"[:300])
+        time.sleep(PAUSA)
+    metodo = "busca"
+    if falhas == len(TERMOS):
+        metodo = "leitura"
+        for secao in ("do3", "do3e"):
             try:
-                url, txt = texto_integral(s, it.get("urlTitle", ""))
+                for it in leitura_jornal(s, dia, secao, diag):
+                    if it.get("urlTitle"):
+                        itens.setdefault(it["urlTitle"], it)
             except Exception as e:  # noqa: BLE001
-                base["url"] = f"{BASE}/web/dou/-/{it.get('urlTitle', '')}"
-                base["resumo"] = " ".join(str(it.get("content", "")).split())[:400]
-                base["erro"] = f"{type(e).__name__}"
-                rel["docentes_sem_area"].append(base)
-                continue
-            base["url"] = url
-            n = norm(txt)
-            sinais = [k for k, rx in SINAIS.items() if rx.search(n)]
-            if sinais:
-                base.update({"sinais": sinais, "trechos": trechos(txt, n, sinais), "texto": txt[:8000]})
-                rel["relevantes"].append(base)
-            elif not ROTULO_AREA.search(n):
-                base["resumo"] = " ".join(txt.split())[:500]
-                rel["docentes_sem_area"].append(base)
+                diag.append(f"leitura {secao}: {type(e).__name__}: {e}"[:300])
+    ok = bool(itens) or (metodo == "busca" and falhas < len(TERMOS))
+    cand = [i for i in itens.values() if eh_edital_docente(i)][:MAX_TEXTOS]
+    rel["consulta"] = {"metodo": metodo, "ok": ok, "atos": len(itens), "docentes": len(cand)}
+    if not ok:
+        rel["erros"].append("DOU indisponível para este dia; ver diagnostico")
+    for it in cand:
+        time.sleep(PAUSA)
+        base = {
+            "titulo": " ".join(sem_tags(it.get("title") or it.get("titulo") or "").split()),
+            "orgao": it.get("hierarchyStr", ""),
+            "instituicao": instituicao(it.get("hierarchyStr", "")),
+            "tipo_ato": it.get("artType", ""),
+            "data": it.get("pubDate", ""),
+            "secao": it.get("pubName", ""),
+            "pagina": it.get("numberPage", ""),
+        }
+        try:
+            url, txt = texto_integral(s, it.get("urlTitle", ""))
+        except Exception as e:  # noqa: BLE001
+            base["url"] = f"{BASE}/web/dou/-/{it.get('urlTitle', '')}"
+            base["resumo"] = " ".join(sem_tags(it.get("content", "")).split())[:400]
+            base["erro"] = type(e).__name__
+            rel["docentes_sem_area"].append(base)
+            continue
+        base["url"] = url
+        n = norm(txt)
+        sinais = [k for k, rx in SINAIS.items() if rx.search(n)]
+        if sinais:
+            base.update({"sinais": sinais, "trechos": trechos(txt, n, sinais), "texto": txt[:8000]})
+            rel["relevantes"].append(base)
+        elif not ROTULO_AREA.search(n):
+            base["resumo"] = " ".join(txt.split())[:500]
+            rel["docentes_sem_area"].append(base)
     return rel
 
 
@@ -193,7 +270,7 @@ def grava(obj, caminho):
 
 
 def consolida():
-    dias = sorted(p for p in glob.glob(os.path.join(SAIDA, "????-??-??.json")))
+    dias = sorted(glob.glob(os.path.join(SAIDA, "????-??-??.json")))
     for velho in dias[:-MANTER_DIAS]:
         os.remove(velho)
     dias = dias[-MANTER_DIAS:]
@@ -203,7 +280,7 @@ def consolida():
     for p in reversed(dias[-DIAS_RECENTES:]):
         with open(p, encoding="utf-8") as f:
             d = json.load(f)
-        recentes["dias"].append({"data": d.get("data"), "secoes": d.get("secoes", {})})
+        recentes["dias"].append({"data": d.get("data"), "consulta": d.get("consulta", {})})
         recentes["erros"] += [f"{d.get('data')}: {e}" for e in d.get("erros", [])]
         for chave in ("relevantes", "docentes_sem_area"):
             for item in d.get(chave, []):
@@ -225,22 +302,24 @@ def main():
     a = ap.parse_args()
     fim = dt.date.fromisoformat(a.data) if a.data else dt.datetime.now(TZ).date()
     s = sessao()
-    falhas = 0
-    for k in range(max(0, a.retro), -1, -1):
+    falhas, total = 0, max(0, a.retro) + 1
+    for k in range(total - 1, -1, -1):
         dia = fim - dt.timedelta(days=k)
         rel = coleta_dia(s, dia)
-        do3 = rel["secoes"].get("do3", {})
-        print(f"{dia}: do3 ok={do3.get('ok')} atos={do3.get('atos')} docentes={do3.get('docentes')} "
-              f"relevantes={len(rel['relevantes'])} sem_area={len(rel['docentes_sem_area'])} erros={rel['erros']}")
-        if do3.get("ok") is False:
-            falhas += 1
+        c = rel["consulta"]
+        print(f"{dia}: metodo={c.get('metodo')} ok={c.get('ok')} atos={c.get('atos')} docentes={c.get('docentes')} "
+              f"relevantes={len(rel['relevantes'])} sem_area={len(rel['docentes_sem_area'])}")
+        for linha in rel["diagnostico"]:
+            print("   ", linha)
         caminho = os.path.join(SAIDA, f"{dia.isoformat()}.json")
-        if do3.get("ok") is False and os.path.exists(caminho):
-            continue
+        if not c.get("ok"):
+            falhas += 1
+            if os.path.exists(caminho):
+                continue
         grava(rel, caminho)
     r = consolida()
     print(f"recentes: relevantes={len(r['relevantes'])} sem_area={len(r['docentes_sem_area'])}")
-    return 1 if falhas == max(0, a.retro) + 1 else 0
+    return 1 if falhas == total else 0
 
 
 if __name__ == "__main__":
