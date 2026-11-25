@@ -1,0 +1,48 @@
+{
+ "gerado_em": "2026-11-25T16:14:18-03:00",
+ "dias": [
+  {
+   "data": "2026-11-25",
+   "secoes": {
+    "do3": {
+     "ok": false
+    },
+    "do3e": {
+     "ok": false
+    }
+   }
+  },
+  {
+   "data": "2026-11-24",
+   "secoes": {
+    "do3": {
+     "ok": false
+    },
+    "do3e": {
+     "ok": false
+    }
+   }
+  },
+  {
+   "data": "2026-11-23",
+   "secoes": {
+    "do3": {
+     "ok": true,
+     "atos": 0,
+     "docentes": 0
+    },
+    "do3e": {
+     "ok": true,
+     "atos": 0,
+     "docentes": 0
+    }
+   }
+  }
+ ],
+ "relevantes": [],
+ "docentes_sem_area": [],
+ "erros": [
+  "2026-11-25: do3: HTTPError: 502 Server Error: Bad Gateway for url: https://www.in.gov.br/leiturajornal?data=25-11-2026&secao=do3",
+  "2026-11-24: do3: HTTPError: 502 Server Error: Bad Gateway for url: https://www.in.gov.br/leiturajornal?data=24-11-2026&secao=do3"
+ ]
+}
